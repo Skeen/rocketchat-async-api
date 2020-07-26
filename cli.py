@@ -100,12 +100,11 @@ def shutdown_loop():
 @async_to_sync
 async def main(username, password, server_url, command):
     async def on_login(data):
-        print(await rocket.subscribe_to_room_messages(
-            room_name="python_rocketchat_async_api",
-        ))
-        return
-
-
+#        print(await rocket.subscribe_to_room_messages(
+#            room_name="python_rocketchat_async_api",
+#        ))
+#        return
+#
         print(await rocket.send_message(
             "test message 2",
             #room_id="YrD4wTPetXeRx9FaJ"
