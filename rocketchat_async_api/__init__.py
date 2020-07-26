@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from uuid import uuid4
 
 import aiohttp
 import structlog
@@ -11,6 +12,60 @@ from structlog.contextvars import (bind_contextvars, clear_contextvars,
 async def shutdown_loop():
     for task in asyncio.all_tasks():
         task.cancel()
+
+from collections import defaultdict
+
+class EventSystem:
+    def __init__(self, logger=None, loop=None):
+        self.handlers = defaultdict(dict)
+        self.logger = logger or structlog.get_logger()
+        self.loop = loop or asyncio.get_event_loop()
+
+    def num_handlers(self, event=None):
+        if event:
+            return len(self.handlers[event])
+        return sum(map(self.num_handlers, self.handlers.keys()))
+
+    def register_handler(self, event, callback, register_id=None):
+        register_id = register_id or uuid4()
+        self.logger.debug(
+            "Registering message handler",
+            handler_event=event,
+            register_id=register_id,
+            count=self.num_handlers()
+        )
+        self.handlers[event][register_id] = callback
+        return register_id
+
+    def unregister_handler(self, event, register_id):
+        self.logger.debug(
+            "Unregistering message handler",
+            handler_event=event,
+            register_id=register_id,
+            count=self.num_handlers()
+        )
+        del self.handlers[event][register_id]
+
+    def clear_handlers(self, event):
+        handler_register_ids = list(self.handlers[event].keys())
+        for register_id in handler_register_ids:
+            self.unregister_handler(event, register_id)
+
+    def fire_event(self, event, data):
+        handlers = self.handlers[event]
+
+        bind_contextvars(handler_event=event)
+        for register_id, callback in handlers.items():
+            bind_contextvars(register_id=register_id)
+            self.logger.debug("Scheduled handler")
+            self.loop.call_soon(
+                lambda callback, data: asyncio.ensure_future(
+                    callback(data)
+                ),
+                callback,
+                data,
+            )
+        return len(handlers)
 
 
 class RocketChat:
@@ -23,7 +78,10 @@ class RocketChat:
         on_login_callback=None,
         on_connect_callback=None,
         on_fatal_error_callback=None,
+        auto_login=True,
+        auto_connect=True
     ):
+        # Bind arguments
         self.username = username
         self.password = password
         self.server_url = server_url
@@ -31,16 +89,14 @@ class RocketChat:
         self.on_login_callback = on_login_callback
         self.on_connect_callback = on_connect_callback
         self.on_fatal_error_callback = on_fatal_error_callback or shutdown_loop
-        self.auto_login = True
-        self.auto_connect = True
-
-        self.message_handlers = {}
-        self.message_result_handlers = {}
-        self.last_message_id = 0
+        self.auto_login = auto_login
+        self.auto_connect = auto_connect
+        # Initialize state
+        self.websocket_event_system = EventSystem(self.logger)
+        self.result_event_system = EventSystem(self.logger)
         self.websocket = None
-
+        # Install default handlers for ping and such
         self._register_default_message_handlers()
-
         self.logger.debug("RocketChat.__init__ ran")
 
     async def get_rooms(self):
@@ -50,62 +106,96 @@ class RocketChat:
         data = await future
         return data["result"]
 
+    async def _room_name_to_id(self, room_name):
+        rooms = (await self.get_rooms())['update']
+        rooms = filter(
+            lambda room: room.get("fname", room["name"]) == room_name, rooms
+        )
+        room = next(rooms, None)
+        if next(rooms, None) is not None:
+            raise ValueError("Ambigious room_name, use room_id")
+        return room['_id']
+
+    async def send_message(self, message, room_id=None, room_name=None):
+        if room_id is None and room_name is None:
+            raise ValueError("Must provide either room_id or room_name")
+        if room_id and room_name:
+            raise ValueError("Cannot provide both room_id and room_name")
+        if room_name:
+            room_id = await self._room_name_to_id(room_name)
+        future = await self._call_method(
+            method="sendMessage",
+            params=[{
+                #"_id": str(uuid4()),
+                "rid": room_id,
+                "msg": message
+            }]
+        )
+        data = await future
+        return data
+
+    async def subscribe_to_room_messages(self, room_id=None, room_name=None):
+        if room_id is None and room_name is None:
+            raise ValueError("Must provide either room_id or room_name")
+        if room_id and room_name:
+            raise ValueError("Cannot provide both room_id and room_name")
+        if room_name:
+            room_id = await self._room_name_to_id(room_name)
+        future = await self._send_message(
+            msg="sub",
+            name="stream-room-messages",
+            params=[
+                room_id, False
+            ]
+        )
+        data = await future
+        return data
+
     async def _on_successful_login(self, data):
         self.logger.info("Successfully logged in!")
         if self.on_login_callback:
             await self.on_login_callback(data)
 
     def _get_message_id(self):
-        self.last_message_id += 1
+        message_id = str(uuid4())
         self.logger.debug(
-            "Getting message_id", message_id=self.last_message_id
+            "Getting message_id", message_id=message_id
         )
-        return self.last_message_id
+        return message_id
 
-    def register_message_handler(self, message_type, callback):
-        self.logger.debug(
-            "Registering message handler",
-            message_type=message_type,
-            count=len(self.message_handlers),
-        )
-        self.message_handlers[message_type] = callback
-
-    def _register_result_handler(self, message_id, callback):
-        self.logger.debug(
-            "Registering result handler",
-            message_id=message_id,
-            count=len(self.message_result_handlers),
-        )
-        self.message_result_handlers[message_id] = callback
-
-    def _unregister_result_handler(self, message_id):
-        self.logger.debug(
-            "Unregistering result handler",
-            message_id=message_id,
-            count=len(self.message_result_handlers),
-        )
-        del self.message_result_handlers[message_id]
-
-    async def _call_method_callback(self, method, params, callback):
+    async def _send_message_callback(self, callback, **kwargs):
         message_id = str(self._get_message_id())
         message_payload = {
-            "msg": "method",
-            "method": method,
             "id": message_id,
-            "params": params,
+            **kwargs
         }
-        self._register_result_handler(message_id, callback)
-        self.logger.debug("Sending method call", payload=message_payload)
+        self.result_event_system.register_handler(message_id, callback)
+        self.logger.debug("Sending message", payload=message_payload)
         await self.websocket.send_json(message_payload)
 
-    async def _call_method(self, method, params):
+    async def _send_message(self, **kwargs):
         future = asyncio.Future()
 
         async def resolve_future(data):
             future.set_result(data)
 
-        await self._call_method_callback(method, params, resolve_future)
+        await self._send_message_callback(resolve_future, **kwargs)
         return future
+
+    async def _call_method_callback(self, method, params, callback):
+        await self._send_message_callback(
+            callback,
+            msg="method",
+            method=method,
+            params=params,
+        )
+
+    async def _call_method(self, method, params):
+        return await self._send_message(
+            msg="method",
+            method=method,
+            params=params
+        )
 
     async def _answer_ping(self, data):
         self.logger.debug("Replying to ping challenge")
@@ -143,37 +233,31 @@ class RocketChat:
         self.logger.debug("Noop handler called")
 
     async def missing_message_result_handler(self, data):
-        self.logger.error(
-            "No message result handler installed for message",
-            result_handlers=list(self.message_result_handlers.keys()),
-        )
+        self.logger.error("No message result handler installed for message")
 
     async def _result_handler(self, data):
         message_id = data["id"]
-        bind_contextvars(message_id=message_id)
-        try:
-            result_handler = self.message_result_handlers[message_id]
-            self._unregister_result_handler(message_id)
-        except KeyError:
+        num_fired = self.result_event_system.fire_event(message_id, data)
+        self.result_event_system.clear_handlers(message_id)
+        if num_fired == 0:
             await self.missing_message_result_handler(data)
-            return
-        self.logger.debug("Running message result handler for message result")
-        await result_handler(data)
 
     def _register_default_message_handlers(self):
         default_handlers = {
             "ping": self._answer_ping,
             "connected": self._connected,
             "result": self._result_handler,
-            "updated": self._noop_handler,
-            "added": self._noop_handler,
+            #"updated": self._noop_handler,
+            #"added": self._noop_handler,
         }
         self.logger.debug(
             "Registering default message handlers",
             handlers=list(default_handlers.keys()),
         )
         for message_type, callback in default_handlers.items():
-            self.register_message_handler(message_type, callback)
+            self.websocket_event_system.register_handler(
+                message_type, callback
+            )
 
     async def connect(self):
         connect_payload = {"msg": "connect", "version": "1", "support": ["1"]}
@@ -220,28 +304,18 @@ class RocketChat:
                 continue
 
             unbind_contextvars("message")
-            bind_contextvars(data=data)
+            # bind_contextvars(data=data)
 
             if "msg" not in data:
                 await self.websocket_message_missing_data_msg(data)
                 continue
 
-            bind_contextvars(message_type=data["msg"])
-            try:
-                message_handler = self.message_handlers[data["msg"]]
-            except KeyError:
-                await self.missing_message_handler(data)
-                continue
-
-            self.logger.debug("Scheduled running message handler for message")
-            loop = asyncio.get_event_loop()
-            loop.call_soon(
-                lambda message_handler, data: asyncio.ensure_future(
-                    message_handler(data)
-                ),
-                message_handler,
-                data,
+            num_fired = self.websocket_event_system.fire_event(
+                event=data["msg"],
+                data=data
             )
+            if num_fired == 0:
+                await self.missing_message_handler(data)
 
     async def start(self):
         async with aiohttp.ClientSession() as session:

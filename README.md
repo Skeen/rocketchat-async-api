@@ -1,4 +1,4 @@
-## rocketchat-async-api
+## rocketchat_async_api
 Python API wrapper for [Rocket.Chat](https://docs.rocket.chat/api/realtime-api)
 
 ### Installation
@@ -13,18 +13,24 @@ Clone our repository and `python3 setup.py install`
 
 ### Usage
 ```python
+import asyncio
 from pprint import pprint
 from rocketchat_async_api import RocketChat
 
 async def on_login(_):
-    pprint(await rocket.me())
-    pprint(await rocket.channels_list())
-    pprint(await rocket.chat_post_message('good news everyone!', channel='GENERAL', alias='Farnsworth'))
-    pprint(await rocket.channels_history('GENERAL', count=5))
+    pprint(await rocket.get_rooms())
+    pprint(await rocket.send_message(
+        "Sending a message into a channel!",
+        #room_id="YrD4wTPetXeRx9FaJ"
+        room_name="python_rocketchat_async_api",
+    ))
 
-rocket = RocketChat('user', 'pass', 'wss://open.rocket.chat/websocket', on_login_callback=on_login)
-await rocket.start()
+async def main():
+    rocket = RocketChat('user', 'pass', 'wss://open.rocket.chat/websocket', on_login_callback=on_login)
+    await rocket.start()
 
+loop = asyncio.get_event_loop()
+loop.run_until_complete(asyncio.ensure_future(main()))
 ```
 
 *note*: every method returns a dict

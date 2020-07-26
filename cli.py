@@ -100,8 +100,24 @@ def shutdown_loop():
 @async_to_sync
 async def main(username, password, server_url, command):
     async def on_login(data):
+        print(await rocket.subscribe_to_room_messages(
+            room_name="python_rocketchat_async_api",
+        ))
+        return
+
+
+        print(await rocket.send_message(
+            "test message 2",
+            #room_id="YrD4wTPetXeRx9FaJ"
+            room_name="python_rocketchat_async_api",
+        ))
+        # Shutdown the loop
+        shutdown_loop()
+        return
+
         # Fetch all rooms
         rooms = (await rocket.get_rooms())["update"]
+        print(json.dumps(rooms, indent=4))
         # Find channels
         rooms = filter(lambda room: room["t"] == "c", rooms)
         # Convert to dict, name --> user count
@@ -124,10 +140,10 @@ async def main(username, password, server_url, command):
 if __name__ == "__main__":
     structlog.configure(
         processors=[
-            structlog.stdlib.filter_by_level,
+            #structlog.stdlib.filter_by_level,
             merge_contextvars,
             structlog.dev.ConsoleRenderer(),
         ],
-        logger_factory=structlog.stdlib.LoggerFactory(),
+        #logger_factory=structlog.stdlib.LoggerFactory(),
     )
     main(auto_envvar_prefix="ROCKETCHAT_CLI")
